@@ -1,6 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Vec, panic_with_error};
 
 #[derive(Clone)]
 #[contracttype]
@@ -32,11 +32,26 @@ pub struct ClaimableBalance {
     pub time_bound: TimeBound,
 }
 
+// Define a CustomError enum with explicit integer literals for all variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CustomError {
+    TooManyClaimants = 1,
+    AlreadyInitialized = 2,
+    TimePredicateNotFulfilled = 3,
+    ClaimantNotAllowed = 4,
+}
+
+// Implement the From<CustomError> trait for soroban_sdk::Error.
+impl From<CustomError> for soroban_sdk::Error {
+    fn from(error: CustomError) -> Self {
+        soroban_sdk::Error::from_contract_error(error as u32)
+    }
+}
+
 #[contract]
 pub struct ClaimableBalanceContract;
 
-// The 'timelock' part: check that provided timestamp is before/after
-// the current ledger timestamp.
+// Check that provided timestamp is before/after the current ledger timestamp.
 fn check_time_bound(env: &Env, time_bound: &TimeBound) -> bool {
     let ledger_timestamp = env.ledger().timestamp();
 
@@ -57,18 +72,14 @@ impl ClaimableBalanceContract {
         time_bound: TimeBound,
     ) {
         if claimants.len() > 10 {
-            panic!("too many claimants");
+            panic_with_error!(env, CustomError::TooManyClaimants);
         }
         if is_initialized(&env) {
-            panic!("contract has been already initialized");
+            panic_with_error!(env, CustomError::AlreadyInitialized);
         }
-        // Make sure `from` address authorized the deposit call with all the
-        // arguments.
         from.require_auth();
 
-        // Transfer token from `from` to this contract address.
         token::Client::new(&env, &token).transfer(&from, &env.current_contract_address(), &amount);
-        // Store all the necessary info to allow one of the claimants to claim it.
         env.storage().instance().set(
             &DataKey::Balance,
             &ClaimableBalance {
@@ -78,38 +89,28 @@ impl ClaimableBalanceContract {
                 claimants,
             },
         );
-        // Mark contract as initialized to prevent double-usage.
-        // Note, that this is just one way to approach initialization - it may
-        // be viable to allow one contract to manage several claimable balances.
         env.storage().instance().set(&DataKey::Init, &());
     }
 
     pub fn claim(env: Env, claimant: Address) {
-        // Make sure claimant has authorized this call, which ensures their
-        // identity.
         claimant.require_auth();
-        // Just get the balance - if it's been claimed, this will simply panic
-        // and terminate the contract execution.
         let claimable_balance: ClaimableBalance =
             env.storage().instance().get(&DataKey::Balance).unwrap();
 
         if !check_time_bound(&env, &claimable_balance.time_bound) {
-            panic!("time predicate is not fulfilled");
+            panic_with_error!(env, CustomError::TimePredicateNotFulfilled);
         }
 
         let claimants = &claimable_balance.claimants;
         if !claimants.contains(&claimant) {
-            panic!("claimant is not allowed to claim this balance");
+            panic_with_error!(env, CustomError::ClaimantNotAllowed);
         }
 
-        // Transfer the stored amount of token to claimant after passing
-        // all the checks.
         token::Client::new(&env, &claimable_balance.token).transfer(
             &env.current_contract_address(),
             &claimant,
             &claimable_balance.amount,
         );
-        // Remove the balance entry to prevent any further claims.
         env.storage().instance().remove(&DataKey::Balance);
     }
 }
